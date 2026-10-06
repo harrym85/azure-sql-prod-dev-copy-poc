@@ -275,10 +275,19 @@ jobs:
       # ----------------------------------------------------------
       # 14. CLEAN UP TEMPORARY FIREWALL RULES
       # ----------------------------------------------------------
+
       - name: Remove temporary SQL firewall rules
         if: always()
         shell: bash
         run: |
+          echo "Checking Azure authentication before firewall cleanup..."
+
+          if ! az account show >/dev/null 2>&1; then
+            echo "Azure authentication was not established."
+            echo "Skipping firewall cleanup because no firewall rules could have been created."
+            exit 0
+          fi
+
           echo "Removing temporary DEV SQL firewall rule..."
 
           az sql server firewall-rule delete \
@@ -286,7 +295,7 @@ jobs:
             --resource-group "$DEV_RESOURCE_GROUP" \
             --server "$DEV_SQL_SERVER_NAME" \
             --name GitHubActionsTemporary \
-            --yes || true
+            || true
 
           echo "Removing temporary PROD SQL firewall rule..."
 
@@ -295,9 +304,9 @@ jobs:
             --resource-group "$PROD_RESOURCE_GROUP" \
             --server "$PROD_SQL_SERVER_NAME" \
             --name GitHubActionsTemporary \
-            --yes || true
+            || true
 
-          echo "Temporary firewall cleanup completed."
+          echo "Temporary firewall cleanup completed."  
 
       # ----------------------------------------------------------
       # 15. SUCCESS MESSAGE
