@@ -112,24 +112,54 @@ jobs:
         run: |
           echo "Checking for existing ${TARGET_DATABASE}..."
 
-          sqlcmd \
-            -S "$DEV_SQL_SERVER" \
-            -d master \
-            -U "$SQL_COPY_USER" \
-            -P "$SQL_COPY_PASSWORD" \
-            -C \
-            -b \
-            -Q "
-              IF DB_ID('${TARGET_DATABASE}') IS NOT NULL
-              BEGIN
-                  PRINT 'Deleting existing DEV database...';
-                  DROP DATABASE [${TARGET_DATABASE}];
-              END
-              ELSE
-              BEGIN
-                  PRINT 'No existing DEV database found.';
-              END
-            "
+          if az sql db show \
+            --subscription "$DEV_SUBSCRIPTION_ID" \
+            --resource-group "$DEV_RESOURCE_GROUP" \
+            --server "$DEV_SQL_SERVER_NAME" \
+            --name "$TARGET_DATABASE" \
+            >/dev/null 2>&1; then
+
+            echo "${TARGET_DATABASE} exists. Deleting it..."
+
+            az sql db delete \
+              --subscription "$DEV_SUBSCRIPTION_ID" \
+              --resource-group "$DEV_RESOURCE_GROUP" \
+              --server "$DEV_SQL_SERVER_NAME" \
+              --name "$TARGET_DATABASE" \
+              --yes
+
+            echo "Waiting for Azure to confirm deletion..."
+
+            for attempt in {1..30}; do
+              if ! az sql db show \
+                --subscription "$DEV_SUBSCRIPTION_ID" \
+                --resource-group "$DEV_RESOURCE_GROUP" \
+                --server "$DEV_SQL_SERVER_NAME" \
+                --name "$TARGET_DATABASE" \
+                >/dev/null 2>&1; then
+
+                echo "${TARGET_DATABASE} has been deleted."
+                break
+              fi
+
+              echo "Attempt ${attempt}/30: database still exists..."
+              sleep 10
+            done
+
+            if az sql db show \
+              --subscription "$DEV_SUBSCRIPTION_ID" \
+              --resource-group "$DEV_RESOURCE_GROUP" \
+              --server "$DEV_SQL_SERVER_NAME" \
+              --name "$TARGET_DATABASE" \
+              >/dev/null 2>&1; then
+
+              echo "ERROR: ${TARGET_DATABASE} still exists after waiting."
+              exit 1
+            fi
+
+          else
+            echo "${TARGET_DATABASE} does not exist. Nothing to delete."
+          fi
 
       - name: Start cross-subscription database copy
         shell: bash
