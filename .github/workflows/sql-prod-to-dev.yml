@@ -12,36 +12,55 @@ permissions:
   id-token: write
   contents: read
 
+concurrency:
+  group: azure-sql-prod-to-dev-refresh
+  cancel-in-progress: false
+
 env:
   DEV_SQL_SERVER: ${{ vars.DEV_SQL_SERVER }}
   DEV_SUBSCRIPTION_ID: ${{ vars.DEV_SUBSCRIPTION_ID }}
   PROD_SUBSCRIPTION_ID: ${{ vars.PROD_SUBSCRIPTION_ID }}
-  SQL_COPY_USER: ${{ secrets.SQL_COPY_USER }}
-  SQL_COPY_PASSWORD: ${{ secrets.SQL_COPY_PASSWORD }}
-  TARGET_DATABASE: DemoProdDB-Dev
+
   DEV_RESOURCE_GROUP: rg-sql-copy-dev-poc
   DEV_SQL_SERVER_NAME: sql-blusky-dev-copy-poc
+
+  PROD_RESOURCE_GROUP: rg-sql-copy-prod-poc
+  PROD_SQL_SERVER_NAME: sql-blusky-prod-copy-poc
+
+  TARGET_DATABASE: DemoProdDB-Dev
+
+  SQL_COPY_USER: ${{ secrets.SQL_COPY_USER }}
+  SQL_COPY_PASSWORD: ${{ secrets.SQL_COPY_PASSWORD }}
 
 jobs:
   refresh-database:
     name: Refresh PROD database into DEV
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
+      # ----------------------------------------------------------
+      # 1. SAFETY CONFIRMATION
+      # ----------------------------------------------------------
       - name: Validate refresh confirmation
         shell: bash
         run: |
           if [[ "${{ inputs.confirm_refresh }}" != "REFRESH" ]]; then
-            echo "Refresh not confirmed."
-            echo "Enter REFRESH when manually running the workflow."
+            echo "ERROR: Refresh not confirmed."
+            echo "Type REFRESH when manually running this workflow."
             exit 1
           fi
 
           echo "Refresh confirmed."
 
+      # ----------------------------------------------------------
+      # 2. CHECKOUT
+      # ----------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # ----------------------------------------------------------
+      # 3. AZURE LOGIN USING OIDC
+      # ----------------------------------------------------------
       - name: Login to Azure using OIDC
         uses: azure/login@v2
         with:
@@ -49,20 +68,30 @@ jobs:
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.DEV_SUBSCRIPTION_ID }}
 
+      # ----------------------------------------------------------
+      # 4. VERIFY AZURE IDENTITY
+      # ----------------------------------------------------------
       - name: Verify Azure identity
+        shell: bash
         run: |
+          echo "Authenticated Azure context:"
+
           az account show \
-            --query "{subscription:name, subscriptionId:id, tenantId:tenantId}" \
+            --query "{Subscription:name,SubscriptionId:id,TenantId:tenantId}" \
             -o table
 
+      # ----------------------------------------------------------
+      # 5. INSTALL SQLCMD
+      # ----------------------------------------------------------
       - name: Install sqlcmd
         shell: bash
         run: |
-          curl https://packages.microsoft.com/keys/microsoft.asc \
-            | sudo tee /etc/apt/trusted.gpg.d/microsoft.asc
+          curl -sSL \
+            https://packages.microsoft.com/config/ubuntu/24.04/packages-microsoft-prod.deb \
+            -o packages-microsoft-prod.deb
 
-          curl https://packages.microsoft.com/config/ubuntu/24.04/prod.list \
-            | sudo tee /etc/apt/sources.list.d/mssql-release.list
+          sudo dpkg -i packages-microsoft-prod.deb
+          rm packages-microsoft-prod.deb
 
           sudo apt-get update
 
@@ -70,34 +99,62 @@ jobs:
 
           echo "/opt/mssql-tools18/bin" >> "$GITHUB_PATH"
 
+      # ----------------------------------------------------------
+      # 6. GET GITHUB RUNNER PUBLIC IP
+      # ----------------------------------------------------------
       - name: Get GitHub runner public IP
         id: runner-ip
         shell: bash
         run: |
-          RUNNER_IP=$(curl -s https://api.ipify.org)
+          RUNNER_IP=$(curl -fsSL https://api.ipify.org)
 
           if [[ -z "$RUNNER_IP" ]]; then
-            echo "Unable to determine GitHub runner public IP."
+            echo "ERROR: Unable to determine GitHub runner public IP."
             exit 1
           fi
 
-          echo "Runner IP: ${RUNNER_IP}"
+          echo "GitHub runner IP: ${RUNNER_IP}"
           echo "ip=${RUNNER_IP}" >> "$GITHUB_OUTPUT"
 
-      - name: Temporarily allow runner through DEV SQL firewall
+      # ----------------------------------------------------------
+      # 7. TEMPORARILY ALLOW RUNNER ON BOTH SQL SERVERS
+      # ----------------------------------------------------------
+      - name: Temporarily allow runner through SQL firewalls
         shell: bash
         run: |
+          RUNNER_IP="${{ steps.runner-ip.outputs.ip }}"
+
+          echo "Adding temporary DEV SQL firewall rule..."
+
           az sql server firewall-rule create \
             --subscription "$DEV_SUBSCRIPTION_ID" \
             --resource-group "$DEV_RESOURCE_GROUP" \
             --server "$DEV_SQL_SERVER_NAME" \
             --name GitHubActionsTemporary \
-            --start-ip-address "${{ steps.runner-ip.outputs.ip }}" \
-            --end-ip-address "${{ steps.runner-ip.outputs.ip }}"
+            --start-ip-address "$RUNNER_IP" \
+            --end-ip-address "$RUNNER_IP"
 
+          echo "Adding temporary PROD SQL firewall rule..."
+
+          az sql server firewall-rule create \
+            --subscription "$PROD_SUBSCRIPTION_ID" \
+            --resource-group "$PROD_RESOURCE_GROUP" \
+            --server "$PROD_SQL_SERVER_NAME" \
+            --name GitHubActionsTemporary \
+            --start-ip-address "$RUNNER_IP" \
+            --end-ip-address "$RUNNER_IP"
+
+          echo "Waiting for SQL firewall rules to propagate..."
+          sleep 20
+
+      # ----------------------------------------------------------
+      # 8. TEST DEV SQL CONNECTION
+      # ----------------------------------------------------------
       - name: Test DEV SQL connectivity
         shell: bash
         run: |
+          echo "Testing connection to DEV SQL master..."
+
           sqlcmd \
             -S "$DEV_SQL_SERVER" \
             -d master \
@@ -105,8 +162,11 @@ jobs:
             -P "$SQL_COPY_PASSWORD" \
             -C \
             -b \
-            -Q "SELECT DB_NAME() AS ConnectedDatabase;"
+            -Q "SELECT @@SERVERNAME AS ServerName, DB_NAME() AS DatabaseName;"
 
+      # ----------------------------------------------------------
+      # 9. DELETE EXISTING DEV COPY
+      # ----------------------------------------------------------
       - name: Remove existing DEV database
         shell: bash
         run: |
@@ -119,7 +179,8 @@ jobs:
             --name "$TARGET_DATABASE" \
             >/dev/null 2>&1; then
 
-            echo "${TARGET_DATABASE} exists. Deleting it..."
+            echo "${TARGET_DATABASE} exists."
+            echo "Deleting existing DEV database..."
 
             az sql db delete \
               --subscription "$DEV_SUBSCRIPTION_ID" \
@@ -130,7 +191,10 @@ jobs:
 
             echo "Waiting for Azure to confirm deletion..."
 
+            DELETED=false
+
             for attempt in {1..30}; do
+
               if ! az sql db show \
                 --subscription "$DEV_SUBSCRIPTION_ID" \
                 --resource-group "$DEV_RESOURCE_GROUP" \
@@ -139,6 +203,7 @@ jobs:
                 >/dev/null 2>&1; then
 
                 echo "${TARGET_DATABASE} has been deleted."
+                DELETED=true
                 break
               fi
 
@@ -146,31 +211,37 @@ jobs:
               sleep 10
             done
 
-            if az sql db show \
-              --subscription "$DEV_SUBSCRIPTION_ID" \
-              --resource-group "$DEV_RESOURCE_GROUP" \
-              --server "$DEV_SQL_SERVER_NAME" \
-              --name "$TARGET_DATABASE" \
-              >/dev/null 2>&1; then
-
-              echo "ERROR: ${TARGET_DATABASE} still exists after waiting."
+            if [[ "$DELETED" != "true" ]]; then
+              echo "ERROR: ${TARGET_DATABASE} still exists."
               exit 1
             fi
 
           else
-            echo "${TARGET_DATABASE} does not exist. Nothing to delete."
+            echo "${TARGET_DATABASE} does not exist."
+            echo "Nothing to delete."
           fi
 
+      # ----------------------------------------------------------
+      # 10. START PROD -> DEV CROSS-SUBSCRIPTION COPY
+      # ----------------------------------------------------------
       - name: Start cross-subscription database copy
         shell: bash
         run: |
+          echo "Starting PROD -> DEV database copy..."
+
           ./scripts/copy-database.sh
 
+      # ----------------------------------------------------------
+      # 11. WAIT FOR COPY TO COMPLETE
+      # ----------------------------------------------------------
       - name: Wait for database copy
         shell: bash
         run: |
           ./scripts/wait-for-copy.sh
 
+      # ----------------------------------------------------------
+      # 12. VALIDATE COPIED DATABASE
+      # ----------------------------------------------------------
       - name: Validate copied database
         shell: bash
         run: |
@@ -185,9 +256,14 @@ jobs:
             -b \
             -i sql/03-validate.sql
 
+      # ----------------------------------------------------------
+      # 13. CONFIRM AZURE DATABASE STATUS
+      # ----------------------------------------------------------
       - name: Confirm Azure database status
         shell: bash
         run: |
+          echo "Checking final Azure database status..."
+
           az sql db show \
             --subscription "$DEV_SUBSCRIPTION_ID" \
             --resource-group "$DEV_RESOURCE_GROUP" \
@@ -196,10 +272,15 @@ jobs:
             --query "{Database:name,Status:status,Location:location}" \
             -o table
 
-      - name: Remove temporary SQL firewall rule
+      # ----------------------------------------------------------
+      # 14. CLEAN UP TEMPORARY FIREWALL RULES
+      # ----------------------------------------------------------
+      - name: Remove temporary SQL firewall rules
         if: always()
         shell: bash
         run: |
+          echo "Removing temporary DEV SQL firewall rule..."
+
           az sql server firewall-rule delete \
             --subscription "$DEV_SUBSCRIPTION_ID" \
             --resource-group "$DEV_RESOURCE_GROUP" \
@@ -207,12 +288,29 @@ jobs:
             --name GitHubActionsTemporary \
             --yes || true
 
+          echo "Removing temporary PROD SQL firewall rule..."
+
+          az sql server firewall-rule delete \
+            --subscription "$PROD_SUBSCRIPTION_ID" \
+            --resource-group "$PROD_RESOURCE_GROUP" \
+            --server "$PROD_SQL_SERVER_NAME" \
+            --name GitHubActionsTemporary \
+            --yes || true
+
+          echo "Temporary firewall cleanup completed."
+
+      # ----------------------------------------------------------
+      # 15. SUCCESS MESSAGE
+      # ----------------------------------------------------------
       - name: Refresh completed
         shell: bash
         run: |
-          echo "============================================"
-          echo " PROD -> DEV DATABASE REFRESH SUCCESSFUL"
-          echo "============================================"
-          echo "Source : DemoProdDB"
-          echo "Target : ${TARGET_DATABASE}"
-          echo "Status : ONLINE and validated"
+          echo "=============================================="
+          echo " AZURE SQL PROD -> DEV REFRESH SUCCESSFUL"
+          echo "=============================================="
+          echo "Source server   : ${PROD_SQL_SERVER_NAME}"
+          echo "Source database : DemoProdDB"
+          echo "Target server   : ${DEV_SQL_SERVER_NAME}"
+          echo "Target database : ${TARGET_DATABASE}"
+          echo "Status          : ONLINE and validated"
+          echo "=============================================="
