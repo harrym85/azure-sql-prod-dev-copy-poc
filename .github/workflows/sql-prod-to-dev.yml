@@ -1,0 +1,188 @@
+name: Azure SQL - PROD to DEV Refresh
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_refresh:
+        description: "Type REFRESH to confirm replacement of DemoProdDB-Dev"
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  DEV_SQL_SERVER: ${{ vars.DEV_SQL_SERVER }}
+  DEV_SUBSCRIPTION_ID: ${{ vars.DEV_SUBSCRIPTION_ID }}
+  PROD_SUBSCRIPTION_ID: ${{ vars.PROD_SUBSCRIPTION_ID }}
+  SQL_COPY_USER: ${{ secrets.SQL_COPY_USER }}
+  SQL_COPY_PASSWORD: ${{ secrets.SQL_COPY_PASSWORD }}
+  TARGET_DATABASE: DemoProdDB-Dev
+  DEV_RESOURCE_GROUP: rg-sql-copy-dev-poc
+  DEV_SQL_SERVER_NAME: sql-blusky-dev-copy-poc
+
+jobs:
+  refresh-database:
+    name: Refresh PROD database into DEV
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validate refresh confirmation
+        shell: bash
+        run: |
+          if [[ "${{ inputs.confirm_refresh }}" != "REFRESH" ]]; then
+            echo "Refresh not confirmed."
+            echo "Enter REFRESH when manually running the workflow."
+            exit 1
+          fi
+
+          echo "Refresh confirmed."
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Login to Azure using OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.DEV_SUBSCRIPTION_ID }}
+
+      - name: Verify Azure identity
+        run: |
+          az account show \
+            --query "{subscription:name, subscriptionId:id, tenantId:tenantId}" \
+            -o table
+
+      - name: Install sqlcmd
+        shell: bash
+        run: |
+          curl https://packages.microsoft.com/keys/microsoft.asc \
+            | sudo tee /etc/apt/trusted.gpg.d/microsoft.asc
+
+          curl https://packages.microsoft.com/config/ubuntu/24.04/prod.list \
+            | sudo tee /etc/apt/sources.list.d/mssql-release.list
+
+          sudo apt-get update
+
+          sudo ACCEPT_EULA=Y apt-get install -y mssql-tools18 unixodbc-dev
+
+          echo "/opt/mssql-tools18/bin" >> "$GITHUB_PATH"
+
+      - name: Get GitHub runner public IP
+        id: runner-ip
+        shell: bash
+        run: |
+          RUNNER_IP=$(curl -s https://api.ipify.org)
+
+          if [[ -z "$RUNNER_IP" ]]; then
+            echo "Unable to determine GitHub runner public IP."
+            exit 1
+          fi
+
+          echo "Runner IP: ${RUNNER_IP}"
+          echo "ip=${RUNNER_IP}" >> "$GITHUB_OUTPUT"
+
+      - name: Temporarily allow runner through DEV SQL firewall
+        shell: bash
+        run: |
+          az sql server firewall-rule create \
+            --subscription "$DEV_SUBSCRIPTION_ID" \
+            --resource-group "$DEV_RESOURCE_GROUP" \
+            --server "$DEV_SQL_SERVER_NAME" \
+            --name GitHubActionsTemporary \
+            --start-ip-address "${{ steps.runner-ip.outputs.ip }}" \
+            --end-ip-address "${{ steps.runner-ip.outputs.ip }}"
+
+      - name: Test DEV SQL connectivity
+        shell: bash
+        run: |
+          sqlcmd \
+            -S "$DEV_SQL_SERVER" \
+            -d master \
+            -U "$SQL_COPY_USER" \
+            -P "$SQL_COPY_PASSWORD" \
+            -C \
+            -b \
+            -Q "SELECT DB_NAME() AS ConnectedDatabase;"
+
+      - name: Remove existing DEV database
+        shell: bash
+        run: |
+          echo "Checking for existing ${TARGET_DATABASE}..."
+
+          sqlcmd \
+            -S "$DEV_SQL_SERVER" \
+            -d master \
+            -U "$SQL_COPY_USER" \
+            -P "$SQL_COPY_PASSWORD" \
+            -C \
+            -b \
+            -Q "
+              IF DB_ID('${TARGET_DATABASE}') IS NOT NULL
+              BEGIN
+                  PRINT 'Deleting existing DEV database...';
+                  DROP DATABASE [${TARGET_DATABASE}];
+              END
+              ELSE
+              BEGIN
+                  PRINT 'No existing DEV database found.';
+              END
+            "
+
+      - name: Start cross-subscription database copy
+        shell: bash
+        run: |
+          ./scripts/copy-database.sh
+
+      - name: Wait for database copy
+        shell: bash
+        run: |
+          ./scripts/wait-for-copy.sh
+
+      - name: Validate copied database
+        shell: bash
+        run: |
+          echo "Validating ${TARGET_DATABASE}..."
+
+          sqlcmd \
+            -S "$DEV_SQL_SERVER" \
+            -d "$TARGET_DATABASE" \
+            -U "$SQL_COPY_USER" \
+            -P "$SQL_COPY_PASSWORD" \
+            -C \
+            -b \
+            -i sql/03-validate.sql
+
+      - name: Confirm Azure database status
+        shell: bash
+        run: |
+          az sql db show \
+            --subscription "$DEV_SUBSCRIPTION_ID" \
+            --resource-group "$DEV_RESOURCE_GROUP" \
+            --server "$DEV_SQL_SERVER_NAME" \
+            --name "$TARGET_DATABASE" \
+            --query "{Database:name,Status:status,Location:location}" \
+            -o table
+
+      - name: Remove temporary SQL firewall rule
+        if: always()
+        shell: bash
+        run: |
+          az sql server firewall-rule delete \
+            --subscription "$DEV_SUBSCRIPTION_ID" \
+            --resource-group "$DEV_RESOURCE_GROUP" \
+            --server "$DEV_SQL_SERVER_NAME" \
+            --name GitHubActionsTemporary \
+            --yes || true
+
+      - name: Refresh completed
+        shell: bash
+        run: |
+          echo "============================================"
+          echo " PROD -> DEV DATABASE REFRESH SUCCESSFUL"
+          echo "============================================"
+          echo "Source : DemoProdDB"
+          echo "Target : ${TARGET_DATABASE}"
+          echo "Status : ONLINE and validated"
