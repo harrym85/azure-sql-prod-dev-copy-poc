@@ -179,8 +179,7 @@ jobs:
             --name "$TARGET_DATABASE" \
             >/dev/null 2>&1; then
 
-            echo "${TARGET_DATABASE} exists."
-            echo "Deleting existing DEV database..."
+            echo "${TARGET_DATABASE} exists. Deleting..."
 
             az sql db delete \
               --subscription "$DEV_SUBSCRIPTION_ID" \
@@ -189,37 +188,42 @@ jobs:
               --name "$TARGET_DATABASE" \
               --yes
 
-            echo "Waiting for Azure to confirm deletion..."
+          else
+            echo "ARM no longer reports ${TARGET_DATABASE}."
+          fi
 
-            DELETED=false
+          echo "Waiting for SQL Server to release database name..."
 
-            for attempt in {1..30}; do
+          for attempt in {1..60}; do
 
-              if ! az sql db show \
-                --subscription "$DEV_SUBSCRIPTION_ID" \
-                --resource-group "$DEV_RESOURCE_GROUP" \
-                --server "$DEV_SQL_SERVER_NAME" \
-                --name "$TARGET_DATABASE" \
-                >/dev/null 2>&1; then
+            DB_EXISTS=$(sqlcmd \
+              -S "$DEV_SQL_SERVER" \
+              -d master \
+              -U "$SQL_COPY_USER" \
+              -P "$SQL_COPY_PASSWORD" \
+              -C \
+              -h -1 \
+              -W \
+              -Q "SET NOCOUNT ON;
+                  SELECT CASE
+                    WHEN DB_ID('${TARGET_DATABASE}') IS NULL THEN 'DELETED'
+                    ELSE 'EXISTS'
+                  END;" \
+              | tr -d '\r' \
+              | xargs)
 
-                echo "${TARGET_DATABASE} has been deleted."
-                DELETED=true
-                break
-              fi
+            echo "Attempt ${attempt}/60: ${DB_EXISTS}"
 
-              echo "Attempt ${attempt}/30: database still exists..."
-              sleep 10
-            done
-
-            if [[ "$DELETED" != "true" ]]; then
-              echo "ERROR: ${TARGET_DATABASE} still exists."
-              exit 1
+            if [[ "$DB_EXISTS" == "DELETED" ]]; then
+              echo "${TARGET_DATABASE} is fully removed from SQL Server."
+              exit 0
             fi
 
-          else
-            echo "${TARGET_DATABASE} does not exist."
-            echo "Nothing to delete."
-          fi
+            sleep 10
+          done
+
+          echo "ERROR: ${TARGET_DATABASE} was not fully removed."
+          exit 1
 
       # ----------------------------------------------------------
       # 10. START PROD -> DEV CROSS-SUBSCRIPTION COPY
